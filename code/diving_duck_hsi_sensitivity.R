@@ -1,0 +1,600 @@
+# =============================================================================
+# Diving Duck HSI: Scoring, Sensitivity Analysis, and Redundancy Assessment
+# Coded at both BARCODE (survey point) and Aquatic Area (polygon) levels
+#
+# Model structure: each variable scored 1–10, summed to max 80, HSI = sum / 80
+#
+# Variables:
+#   V1 - Size of water body (Acres)
+#   V2 - Water depth: % area 18" to 5' (proxied from avg rake depth, m)
+#   V3 - Percent submergent vegetation cover (two operationalizations)
+#   V4 - Species of submergent vegetation present (key species coverage + bonus)
+#   V5 - Percent emergent vegetation cover (unimodal)
+#   V6 - Species of emergent vegetation present (key species coverage + bonus)
+#   V7 - Invertebrate populations present        [CONSTANT = 5 (midpoint)]
+#   V8 - Disturbance (hunting access)            [CONSTANT = 6 (no hunting,
+#                                                 some human activity)]
+# =============================================================================
+
+library(tidyverse)
+library(sf)
+library(ggcorrplot)
+
+# =============================================================================
+# SECTION 0: Load and prepare data
+# =============================================================================
+
+raw_sav <- read_csv("data/ltrm_veg_srs_data_0611093645/ltrm_vegsrs_data.csv")
+
+aqa_dat <- st_read("data/aqa/aqa_2010_lvl3_011918.shp") %>%
+  mutate(across(where(is.numeric), ~ na_if(.x, -9999))) %>%
+  select(uniq_id, Acres)
+
+sav_sub1 <- raw_sav %>%
+  mutate(date = as.Date(DATE, "%m/%d/%Y"),
+         YEAR = format(date, "%Y")) %>%
+  relocate(date, .after = DATE) %>%
+  filter(YEAR >= 2010 & YEAR <= 2019)
+
+sav_sf <- sav_sub1 %>%
+  select(BARCODE, EAST_U, NORTH_U) %>%
+  distinct() %>%
+  st_as_sf(coords = c("EAST_U", "NORTH_U"), crs = st_crs(26915))
+
+sav_aqa <- st_intersection(sav_sf, aqa_dat) %>%
+  st_drop_geometry() %>%
+  rename(aqa_uniq_id = uniq_id)
+
+sav_sub <- left_join(sav_sub1, sav_aqa) %>%
+  filter(!is.na(Acres))
+
+barcode_df <- select(sav_sub, BARCODE, aqa_uniq_id, Acres) %>% distinct()
+
+# =============================================================================
+# SECTION 1: Assemble raw variables at BARCODE level
+# =============================================================================
+
+# Ordinal cover scale → percent midpoints (used for V5, V6)
+# 0 = absent; 1 = 1–20%; 2 = 21–40%; 3 = 41–60%; 4 = 61–80%; 5 = 81–100%
+cov_e_to_pct <- c("0" = 0, "1" = 10, "2" = 30, "3" = 50, "4" = 70, "5" = 90)
+
+# V1: Size of water body (Acres) — from aquatic area polygon
+v1_size <- barcode_df %>%
+  select(BARCODE, aqa_uniq_id, Acres)
+
+# V2: Water depth proxy — mean of 6 rake depths (m → cm)
+#     NOTE: model calls for % area 18"–5' (46–152 cm); without bathymetric data
+#     we use avg depth as a proxy. Depth scoring categories below are calibrated
+#     to avg depth as a stand-in for the % area in range. Flag for future
+#     refinement if bathymetric data becomes available.
+v2_depth <- sav_sub %>%
+  group_by(BARCODE) %>%
+  summarize(avg_depth_cm = mean(c(DEPTH1, DEPTH2, DEPTH3, DEPTH4, DEPTH5, DEPTH6),
+                                na.rm = TRUE) * 100)  # meters → cm
+
+# V3: Percent submergent vegetation cover — two operationalizations
+#   v3a (SME preferred): proportion of 6 rakes with any SAV → percent (0–100%)
+#   v3b (abundance-based): mean DENSITY score across 6 rakes (0–5 scale → % via ×20)
+v3_sav_cover <- sav_sub %>%
+  select(BARCODE, DENSITY1:DENSITY6) %>%
+  distinct() %>%
+  group_by(BARCODE) %>%
+  summarize(
+    sav_presence_pct = mean(c(DENSITY1, DENSITY2, DENSITY3,
+                              DENSITY4, DENSITY5, DENSITY6) > 0,
+                            na.rm = TRUE) * 100,
+    avg_sav_density  = mean(c(DENSITY1, DENSITY2, DENSITY3,
+                              DENSITY4, DENSITY5, DENSITY6),
+                            na.rm = TRUE) * 20   # 0–5 scale → 0–100%
+  )
+
+# V4: Key SAV species coverage and species richness bonus
+#     Key species: VAAM3 = wild celery, POPE6 = sago pondweed,
+#     NLPW, POCR3, PONO2, POZO, ZAPA = other pondweeds
+#     food_sav_pct: median summed rake score across 6 rakes, converted to %
+#     n_food_sav_sp: number of distinct key species (bonus point if > 1)
+sav_food_species <- c("VAAM3", "POPE6", "NLPW", "POCR3", "PONO2", "POZO", "ZAPA")
+
+v4_food_sav <- sav_sub %>%
+  select(BARCODE, SPPCD, RAKE1:RAKE6) %>%
+  filter(SPPCD %in% sav_food_species) %>%
+  group_by(BARCODE) %>%
+  summarize(across(RAKE1:RAKE6, sum, na.rm = TRUE),
+            n_food_sav_sp = n_distinct(SPPCD)) %>%
+  rowwise() %>%
+  mutate(food_sav_pct = median(c_across(RAKE1:RAKE6), na.rm = TRUE) * 20) %>%
+  ungroup() %>%
+  select(BARCODE, food_sav_pct, n_food_sav_sp)
+
+v4_food_sav_all <- left_join(select(barcode_df, BARCODE), v4_food_sav) %>%
+  replace_na(list(food_sav_pct = 0, n_food_sav_sp = 0))
+
+# V5: Percent emergent vegetation cover (ordinal → percent midpoints)
+v5_emerg_cover <- sav_sub %>%
+  select(BARCODE, COV_E) %>%
+  distinct() %>%
+  mutate(emerg_cover_pct = cov_e_to_pct[as.character(COV_E)]) %>%
+  group_by(BARCODE) %>%
+  summarize(avg_emerg_cover = mean(emerg_cover_pct, na.rm = TRUE))
+
+# V6: Key emergent species coverage and species richness bonus
+#     Key species: SARI = stiff arrowhead, SCVA = softstem bulrush, ZIAQ = wild rice
+#     emerg_food_cover_pct: sum of per-species ordinal cover → percent midpoints
+#     n_emerg_food_sp: number of distinct key species (bonus point if > 1)
+emerg_food_species <- c("SARI", "SCVA", "ZIAQ")
+
+v6_emerg_food <- sav_sub %>%
+  select(BARCODE, SPPCD, COVSPP) %>%
+  filter(SPPCD %in% emerg_food_species) %>%
+  mutate(covspp_pct = cov_e_to_pct[as.character(COVSPP)]) %>%
+  group_by(BARCODE) %>%
+  summarize(n_emerg_food_sp      = n_distinct(SPPCD),
+            emerg_food_cover_pct = sum(covspp_pct, na.rm = TRUE))
+
+v6_emerg_food_all <- left_join(select(barcode_df, BARCODE), v6_emerg_food) %>%
+  replace_na(list(n_emerg_food_sp = 0, emerg_food_cover_pct = 0))
+
+# V7 & V8: Constants
+# V7: Inverts — set to 5 (midpoint; dropped per SME but retained as constant
+#     so total score denominator remains 80 for comparability with original model)
+# V8: Disturbance — set to 6 (no hunting but some human activity during migration)
+CONST_V7_score <- 5
+CONST_V8_score <- 6
+
+# =============================================================================
+# SECTION 2: Scoring Functions (1–10 per variable, per model documentation)
+# =============================================================================
+
+# V1: Size of water body (Acres)
+#   < 100      → 1
+#   100–200    → 5
+#   200–1,000  → 7
+#   > 1,000    → 10
+score_v1_size <- function(acres) {
+  case_when(
+    is.na(acres)    ~ NA_real_,
+    acres < 100     ~ 1,
+    acres < 200     ~ 5,
+    acres < 1000    ~ 7,
+    TRUE            ~ 10
+  )
+}
+
+# V2: Water depth — % area 18"–5' (proxied by avg depth in cm)
+#     Scoring categories mapped to avg depth as proxy for % area in range:
+#     avg depth < 30 cm → mostly too shallow → < 10% of area in range → score 1
+#     avg depth 30–76 cm → transitional        → 10–40%                → score 3
+#     avg depth 76–152 cm → mostly in range    → 40–70%                → score 5
+#     avg depth > 152 cm → mostly in range or deeper, still scoring 5–10
+#     NOTE: this proxy mapping is an approximation; update with bathy data.
+score_v2_depth <- function(depth_cm) {
+  case_when(
+    is.na(depth_cm)   ~ NA_real_,
+    depth_cm < 30     ~ 1,
+    depth_cm < 76     ~ 3,
+    depth_cm < 152    ~ 5,
+    TRUE              ~ 10
+  )
+}
+
+# V3: Percent submergent vegetation cover
+#   < 10%      → 1
+#   10–30%     → 3
+#   30–50%     → 6
+#   > 50%      → 10
+score_v3_sav <- function(pct) {
+  case_when(
+    is.na(pct) ~ NA_real_,
+    pct < 10   ~ 1,
+    pct < 30   ~ 3,
+    pct < 50   ~ 6,
+    TRUE       ~ 10
+  )
+}
+
+# V4: Key SAV species coverage + bonus point for multiple species
+#     Base score from coverage of key species; +1 if > 1 key species present
+#     (bonus capped so total does not exceed 10)
+#   None or < 10%  → 1  (no bonus applicable)
+#   10–30%         → 3  (+1 if > 1 species → 4)
+#   30–60%         → 6  (+1 if > 1 species → 7)
+#   > 60%          → 10 (no bonus; already at max)
+score_v4_food_sav <- function(pct, n_sp) {
+  base <- case_when(
+    is.na(pct) ~ NA_real_,
+    pct < 10   ~ 1,
+    pct < 30   ~ 3,
+    pct < 60   ~ 6,
+    TRUE       ~ 10
+  )
+  bonus <- if_else(!is.na(n_sp) & n_sp > 1 & base < 10, 1, 0)
+  pmin(base + bonus, 10)
+}
+
+# V5: Percent emergent vegetation cover (unimodal — both low and high score poorly)
+#   < 10% or > 50%  → 1
+#   10–20% or 30–50% → 5
+#   20–30%           → 10
+score_v5_emerg <- function(pct) {
+  case_when(
+    is.na(pct)              ~ NA_real_,
+    pct < 10                ~ 1,
+    pct < 20                ~ 5,
+    pct < 30                ~ 10,
+    pct < 50                ~ 5,
+    TRUE                    ~ 1
+  )
+}
+
+# V6: Key emergent species coverage + bonus point for multiple species
+#     Same structure as V4
+#   None or < 10%  → 1
+#   10–30%         → 3  (+1 if > 1 species → 4)
+#   30–60%         → 6  (+1 if > 1 species → 7)
+#   > 60%          → 10
+score_v6_emerg_sp <- function(pct, n_sp) {
+  base <- case_when(
+    is.na(pct) ~ NA_real_,
+    pct < 10   ~ 1,
+    pct < 30   ~ 3,
+    pct < 60   ~ 6,
+    TRUE       ~ 10
+  )
+  bonus <- if_else(!is.na(n_sp) & n_sp > 1 & base < 10, 1, 0)
+  pmin(base + bonus, 10)
+}
+
+# =============================================================================
+# SECTION 3: Compute scores and HSI at BARCODE level
+# =============================================================================
+
+barcode_vars <- barcode_df %>%
+  left_join(v2_depth,          by = "BARCODE") %>%
+  left_join(v3_sav_cover,      by = "BARCODE") %>%
+  left_join(v4_food_sav_all,   by = "BARCODE") %>%
+  left_join(v5_emerg_cover,    by = "BARCODE") %>%
+  left_join(v6_emerg_food_all, by = "BARCODE")
+
+barcode_scores <- barcode_vars %>%
+  mutate(
+    sc_v1  = score_v1_size(Acres),
+    sc_v2  = score_v2_depth(avg_depth_cm),
+    sc_v3a = score_v3_sav(sav_presence_pct),   # SME preferred: presence-based %
+    sc_v3b = score_v3_sav(avg_sav_density),     # abundance-based %
+    sc_v4  = score_v4_food_sav(food_sav_pct, n_food_sav_sp),
+    sc_v5  = score_v5_emerg(avg_emerg_cover),
+    sc_v6  = score_v6_emerg_sp(emerg_food_cover_pct, n_emerg_food_sp),
+    #sc_v7  = CONST_V7_score,
+    sc_v8  = CONST_V8_score
+  )
+
+score_cols <- c("sc_v1", "sc_v2", "sc_v3a", "sc_v4", "sc_v5", "sc_v6",
+                #"sc_v7", 
+                "sc_v8")
+
+# HSI = total score / 70 (maximum possible)
+barcode_hsi <- barcode_scores %>%
+  rowwise() %>%
+  mutate(
+    total_score_v3a = sum(c_across(all_of(score_cols)), na.rm = FALSE),
+    total_score_v3b = sum(c_across(all_of(
+      replace(score_cols, score_cols == "sc_v3a", "sc_v3b")
+    )), na.rm = FALSE),
+    HSI_full    = total_score_v3a / 70,
+    HSI_v3b     = total_score_v3b / 70
+  ) %>%
+  ungroup()
+
+# Quick comparison: do the two V3 operationalizations agree?
+cat("Spearman correlation between HSI_v3a and HSI_v3b:\n")
+print(cor(barcode_hsi$HSI_full, barcode_hsi$HSI_v3b,
+          method = "spearman", use = "complete.obs"))
+cat("\nMean absolute HSI difference (v3a vs v3b):\n")
+print(mean(abs(barcode_hsi$HSI_full - barcode_hsi$HSI_v3b), na.rm = TRUE))
+
+# Summary of HSI distribution
+cat("\nHSI summary (primary model, V3a):\n")
+print(summary(barcode_hsi$HSI_full))
+
+# =============================================================================
+# SECTION 4: Aggregate to Aquatic Area (polygon) level
+# =============================================================================
+
+aqa_scores <- barcode_hsi %>%
+  group_by(aqa_uniq_id) %>%
+  summarize(
+    n_barcodes      = n(),
+    across(all_of(score_cols),
+           list(mean = ~ mean(.x, na.rm = TRUE),
+                sd   = ~ sd(.x,   na.rm = TRUE)),
+           .names = "{.col}_{.fn}"),
+    HSI_mean        = mean(HSI_full,      na.rm = TRUE),
+    HSI_median      = median(HSI_full,    na.rm = TRUE),
+    HSI_sd          = sd(HSI_full,        na.rm = TRUE),
+    total_score_mean = mean(total_score_v3a, na.rm = TRUE),
+    Acres           = first(Acres)
+  ) %>%
+  # Polygon-level HSI from mean scores (may differ from mean of barcode HSIs
+  # at score boundaries; report both)
+  mutate(HSI_from_mean_scores = rowSums(
+    select(., ends_with("_mean")), na.rm = FALSE) / 70 # FLAG: divide by 70, not 80
+  )
+
+aqa_hsi_sf <- aqa_dat %>%
+  left_join(aqa_scores, by = c("uniq_id" = "aqa_uniq_id"))
+
+# =============================================================================
+# SECTION 5: One-at-a-time (OAT) Sensitivity Analysis — BARCODE level
+# =============================================================================
+# For each variable, replace its score with the p10 and p90 score across sites,
+# recompute total and HSI, measure the swing in mean HSI (range_delta).
+
+score_bounds <- barcode_hsi %>%
+  summarize(across(all_of(score_cols),
+                   list(p10 = ~ quantile(.x, 0.10, na.rm = TRUE),
+                        p50 = ~ quantile(.x, 0.50, na.rm = TRUE),
+                        p90 = ~ quantile(.x, 0.90, na.rm = TRUE)))) %>%
+  pivot_longer(everything(),
+               names_to  = c("variable", "stat"),
+               names_sep = "_(?=p\\d+$)") %>%
+  pivot_wider(names_from = stat, values_from = value)
+
+print(score_bounds)
+
+compute_oat_hsi <- function(df, focal_var, replacement_score) {
+  tmp_cols <- score_cols
+  df %>%
+    mutate(across(all_of(focal_var), ~ replacement_score)) %>%
+    rowwise() %>%
+    mutate(HSI_oat = sum(c_across(all_of(tmp_cols)), na.rm = FALSE) / 70) %>% #FLAG: This should not be /80, since inverts removed
+    ungroup() %>%
+    pull(HSI_oat)
+}
+
+var_labels <- c(sc_v1  = "V1 Size",
+                sc_v2  = "V2 Depth",
+                sc_v3a = "V3 SAV cover",
+                sc_v4  = "V4 Food SAV",
+                sc_v5  = "V5 Emerg. cover",
+                sc_v6  = "V6 Emerg. sp.",
+                #sc_v7  = "V7 Inverts*",
+                sc_v8  = "V8 Disturbance*")
+
+var_labels <- c(sc_v1  = "Size",
+                sc_v2  = "Depth",
+                sc_v3a = "SAV cover",
+                sc_v4  = "Food SAV",
+                sc_v5  = "Emerg. cover",
+                sc_v6  = "Emerg. sp.",
+                #sc_v7  = "V7 Inverts*",
+                sc_v8  = "Disturbance*")
+
+oat_results <- map_dfr(score_cols, function(var) {
+  p10 <- filter(score_bounds, variable == var)$p10
+  p90 <- filter(score_bounds, variable == var)$p90
+
+  hsi_p10 <- compute_oat_hsi(barcode_hsi, var, p10)
+  hsi_p90 <- compute_oat_hsi(barcode_hsi, var, p90)
+
+  tibble(
+    variable       = var,
+    variable_label = var_labels[var],
+    score_p10      = p10,
+    score_p50      = filter(score_bounds, variable == var)$p50,
+    score_p90      = p90,
+    mean_HSI_base  = mean(barcode_hsi$HSI_full, na.rm = TRUE),
+    mean_HSI_p10   = mean(hsi_p10,              na.rm = TRUE),
+    mean_HSI_p90   = mean(hsi_p90,              na.rm = TRUE),
+    delta_HSI_p10  = mean(barcode_hsi$HSI_full - hsi_p10, na.rm = TRUE),
+    delta_HSI_p90  = mean(hsi_p90 - barcode_hsi$HSI_full, na.rm = TRUE),
+    range_delta    = mean_HSI_p90 - mean_HSI_p10
+  )
+})
+
+oat_ranked <- oat_results %>%
+  arrange(desc(range_delta)) %>%
+  mutate(rank = row_number())
+
+print(oat_ranked)
+
+# =============================================================================
+# SECTION 6: Empirical range check — flag invariant variables
+# =============================================================================
+# Constants (V7, V8) will show IQR = 0 by definition.
+# Other variables with IQR = 0 are empirically invariant across UMR sites.
+
+score_range_check <- barcode_hsi %>%
+  summarize(across(all_of(score_cols),
+                   list(mean = ~ mean(.x, na.rm = TRUE),
+                        sd   = ~ sd(.x,   na.rm = TRUE),
+                        min  = ~ min(.x,   na.rm = TRUE),
+                        max  = ~ max(.x,   na.rm = TRUE),
+                        iqr  = ~ IQR(.x,   na.rm = TRUE)))) %>%
+  pivot_longer(everything(),
+               names_to  = c("variable", "stat"),
+               names_sep = "_(?=(mean|sd|min|max|iqr)$)") %>%
+  pivot_wider(names_from = stat, values_from = value) %>%
+  mutate(
+    empirical_range = max - min,
+    flag_invariant  = iqr == 0,
+    variable_label  = var_labels[variable]
+  ) %>%
+  arrange(iqr)
+
+print(score_range_check)
+
+# =============================================================================
+# SECTION 7: Score correlation matrix — identify redundant variables
+# =============================================================================
+
+score_matrix <- barcode_hsi %>%
+  select(all_of(score_cols)) %>%
+  rename_with(~ unname(var_labels[.x]))
+
+score_cor <- cor(score_matrix, method = "spearman", use = "pairwise.complete.obs")
+print(round(score_cor, 2))
+
+# Correlation heatmap
+ggcorrplot(score_cor,
+           type = "lower",            # Show only the lower triangle
+           lab = TRUE,                # Overlay correlation coefficients
+           lab_size = 4,              # Size of coefficient text
+           method = "square",         # Element shape ("square" or "circle")
+           colors = c("#6D9EC1", "white", "#E46726"), # Diverging color palette
+           ggtheme = theme_minimal())
+
+ggsave(file = "figures/DiD_corr.png", height = 5, width = 6)
+
+score_cor_long <- as.data.frame(as.table(score_cor)) %>%
+  rename(var1 = Var1, var2 = Var2, spearman_r = Freq) %>%
+  filter(#var1 < var2,  # FLAG: This seems wrong; also shouldn't keep r = 1 
+         abs(spearman_r) > 0.7,
+         spearman_r < 1) %>%
+  arrange(desc(abs(spearman_r)))
+
+cat("\nHighly correlated score pairs (|r| > 0.70):\n")
+print(score_cor_long)
+
+# =============================================================================
+# SECTION 8: Reduced-variable HSI
+# =============================================================================
+# Recommended reduced model:
+# Drop V6 (empirically invariant — score = 1 everywhere, no discrimination)
+# Drop V7 (no field data, held constant)
+# Drop V8 (constant pending hunting polygon data)
+# Retain V1, V2, V3, V4, V5 — all show meaningful empirical range
+
+
+# Added Food SAV to reduced list
+drop_vars    <- c("sc_v5", "sc_v6", "sc_v7", "sc_v8")
+reduced_cols <- setdiff(score_cols, drop_vars)
+reduced_max  <- length(reduced_cols) * 10   # 50
+
+barcode_hsi <- barcode_hsi %>%
+  rowwise() %>%
+  mutate(
+    total_score_reduced = sum(c_across(all_of(reduced_cols)), na.rm = FALSE),
+    HSI_reduced         = total_score_reduced / reduced_max
+  ) %>%
+  ungroup()
+
+cat("Full vs. reduced HSI correlation (Spearman):\n")
+print(cor(barcode_hsi$HSI_full, barcode_hsi$HSI_reduced,
+          method = "spearman", use = "complete.obs"))
+
+cat("\nMean absolute HSI difference (full vs. reduced):\n")
+print(mean(abs(barcode_hsi$HSI_full - barcode_hsi$HSI_reduced), na.rm = TRUE))
+
+hsi_comp <- barcode_hsi %>%
+  select(HSI_full, HSI_reduced, BARCODE) %>%
+  pivot_longer(-BARCODE, names_to = "type", values_to = "Overall HSI") %>%
+  mutate("Model\nType" = case_when(type == "HSI_full" ~ "Original Model",
+                                   TRUE ~ "Reduced Model"))
+
+ggplot(hsi_comp, aes(x = `Overall HSI`, fill = `Model\nType`)) +
+  geom_histogram(binwidth = 0.01, position = "identity", alpha = 0.6) +
+  facet_wrap(~`Model\nType`, ncol = 1) +
+  theme_minimal(base_size = 16) +
+  scale_x_continuous(breaks = seq(0.2,0.8,.2))+
+  labs(y = "Count", x = "Overall HSI Score") +
+  theme(legend.position = "none")
+
+ggsave(file = "figures/DiD_HSI_comp.png", height = 5, width = 6)
+
+ggplot(hsi_comp, aes(`Model\nType`,`Overall HSI`, fill = `Model\nType`)) +
+  geom_boxplot()+
+  geom_jitter(alpha = .1, width = .1)+
+  #facet_wrap(~`Model\nType`, ncol = 1) +
+  theme_minimal(base_size = 16) +
+  #scale_x_continuous(breaks = seq(0.2,0.8,.2))+
+  #labs(y = "Count", x = "Overall HSI Score") +
+  theme(legend.position = "none")
+
+ggsave(file = "figures/DiD_HSI_comp.png", height = 5, width = 6)
+
+# =============================================================================
+# SECTION 9: Plots
+# =============================================================================
+
+# --- Tornado plot ---
+oat_plot_data <- oat_ranked %>%
+  select(variable_label, mean_HSI_p10, mean_HSI_base, mean_HSI_p90) %>%
+  pivot_longer(c(mean_HSI_p10, mean_HSI_p90),
+               names_to = "scenario", values_to = "HSI") %>%
+  mutate(
+    scenario       = recode(scenario,
+                            mean_HSI_p10 = "Low Score\nScenario",
+                            mean_HSI_p90 = "High Score\nScenario"),
+    variable_label = fct_reorder(variable_label,
+                                 oat_ranked$range_delta[
+                                   match(variable_label,
+                                         oat_ranked$variable_label)],)
+  ) %>%
+  mutate(scenario = factor(scenario, levels = c("Low Score\nScenario", "High Score\nScenario")))
+
+ggplot(oat_plot_data, aes(x = HSI, y = variable_label, color = scenario)) +
+  geom_vline(xintercept = unique(oat_ranked$mean_HSI_base),
+             linetype = "dashed", color = "grey40") +
+  geom_line(aes(group = variable_label), color = "grey70", linewidth = 1.5) +
+  geom_point(size = 3) +
+  scale_color_manual(values = c("Low Score\nScenario" = "#D55E00",
+                                "High Score\nScenario" = "#0072B2")) +
+  scale_y_discrete(position = "right") +
+  labs(#title = "OAT Sensitivity: Diving Duck HSI",
+       #subtitle = "Mean HSI when each variable score is set to its p10 or p90\n* Constants: no empirical range",
+       x = "Mean HSI across surveys",
+       y = NULL, color = NULL) +
+  theme_minimal(base_size = 16) +
+  theme(legend.position = "bottom")
+
+ggsave("figures/hsi_oat_tornado.png", width = 7, height = 5, dpi = 300)
+
+# --- Full vs reduced HSI scatter ---
+ggplot(barcode_hsi, aes(x = HSI_full, y = HSI_reduced)) +
+  geom_point(alpha = 0.3, size = 0.8) +
+  geom_abline(slope = 1, intercept = 0, color = "firebrick", linetype = "dashed") +
+  labs(title = "Full vs. Reduced Diving Duck HSI",
+       subtitle = paste0("Reduced drops V6, V7 (inverts) and V8 (disturbance); ",
+                         "rescaled to /", reduced_max),
+       x = "HSI — Full model (/70)",
+       y = paste0("HSI — Reduced model (/", reduced_max, ")")) +
+  theme_minimal()
+
+#ggsave("output/hsi_full_vs_reduced.png", width = 6, height = 5, dpi = 150)
+
+# --- Aquatic area HSI distribution ---
+ggplot(aqa_hsi_sf, aes(x = HSI_mean)) +
+  geom_histogram(bins = 30, fill = "#0072B2", color = "white", alpha = 0.8) +
+  labs(title = "Distribution of Diving Duck HSI by Aquatic Area",
+       x = "Mean HSI", y = "Count of aquatic areas") +
+  theme_minimal()
+
+#ggsave("output/hsi_aqa_distribution.png", width = 6, height = 4, dpi = 150)
+
+# --- Map ---
+ggplot(aqa_hsi_sf) +
+  geom_sf(aes(fill = HSI_mean), color = NA) +
+  scale_fill_viridis_c(option = "viridis", name = "Mean HSI",
+                       na.value = "grey85", limits = c(0, 1)) +
+  labs(title = "Diving Duck HSI — Aquatic Area Level") +
+  theme_void()
+
+#ggsave("output/hsi_aqa_map.png", width = 9, height = 11, dpi = 150)
+
+
+# --- Pie Chart ---
+
+
+
+
+# =============================================================================
+# SECTION 10: Export
+# =============================================================================
+
+#write_csv(barcode_hsi,               "output/diving_duck_hsi_barcode.csv")
+#write_csv(aqa_scores,                "output/diving_duck_hsi_aquatic_area.csv")
+#write_csv(oat_ranked,                "output/hsi_oat_sensitivity.csv")
+#write_csv(score_range_check,         "output/hsi_score_range_check.csv")
+#write_csv(as.data.frame(score_cor),  "output/hsi_score_correlation_matrix.csv")
+
+cat("\nDone. Outputs written to /output/\n")

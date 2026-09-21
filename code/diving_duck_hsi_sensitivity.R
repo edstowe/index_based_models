@@ -503,11 +503,11 @@ ggsave(file = "figures/DiD_HSI_comp.png", height = 5, width = 6)
 
 ggplot(hsi_comp, aes(`Model\nType`,`Overall HSI`, fill = `Model\nType`)) +
   geom_boxplot()+
-  geom_jitter(alpha = .1, width = .1)+
+  #geom_jitter(alpha = .1, width = .1)+
   #facet_wrap(~`Model\nType`, ncol = 1) +
-  theme_minimal(base_size = 16) +
+  theme_minimal(base_size = 18) +
   #scale_x_continuous(breaks = seq(0.2,0.8,.2))+
-  #labs(y = "Count", x = "Overall HSI Score") +
+  labs(x = "Model Type") +
   theme(legend.position = "none")
 
 ggsave(file = "figures/DiD_HSI_comp.png", height = 5, width = 6)

@@ -24,7 +24,7 @@ library(ggcorrplot)
 # SECTION 0: Load and prepare data
 # =============================================================================
 
-raw_sav <- read_csv("data/ltrm_veg_srs_data_0921115948/ltrm_vegsrs_data.csv")
+raw_sav <- read_csv("data/ltrm_veg_srs_data_0922082755/ltrm_vegsrs_data.csv")
 
 aqa_dat <- st_read("data/aqa/aqa_2010_lvl3_011918.shp") %>%
   mutate(across(where(is.numeric), ~ na_if(.x, -9999))) %>%

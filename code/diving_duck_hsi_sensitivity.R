@@ -598,3 +598,48 @@ ggplot(aqa_hsi_sf) +
 #write_csv(as.data.frame(score_cor),  "output/hsi_score_correlation_matrix.csv")
 
 cat("\nDone. Outputs written to /output/\n")
+
+
+# Intersect with hydraulic data
+sav_final_loc <- sav_sf %>% filter(BARCODE %in% barcode_df$BARCODE)
+barcode_scores_sf <- left_join(sav_final_loc, barcode_scores) 
+
+# --- Load raster (TIFF or VRT) ---
+raster_path <- "data/PhaseII_Baseflow_60kcfs/Depth_60k.Mississippi_UMR_Ph2_2m_Export_Terrain.Mississippi_UMR_Ph2_2m_Export_Terrain.tif"
+  # or .vrt
+r <- terra::rast(raster_path)
+
+# --- Load point data as sf object ---
+#points_path <- "path/to/points.shp"  # Could also be GeoJSON, CSV with coords, etc.
+pts_sf <- barcode_scores_sf #st_read(points_path)
+
+# --- Ensure CRS matches ---
+if (st_crs(pts_sf) != st_crs(r)) {
+  pts_sf <- st_transform(pts_sf, st_crs(r))
+}
+
+# --- Extract raster values at point locations ---
+# terra::extract() works directly with sf objects
+vals <- terra::extract(r, vect(pts_sf)) %>%
+  rename_with(~c("id", "depth_60k_cfs"))
+
+# Combine extracted values with original point attributes
+pts_with_vals <- bind_cols(pts_sf, vals)
+
+# Correlation
+score_matrix <- pts_with_vals %>%
+  select(depth_60k_cfs, sav_presence_pct, food_sav_pct, emerg_food_cover_pct, avg_emerg_cover) %>%
+  st_drop_geometry()
+
+score_cor <- cor(score_matrix, method = "spearman", use = "pairwise.complete.obs")
+print(round(score_cor, 2))
+
+# Correlation heatmap
+ggcorrplot(score_cor,
+           type = "lower",            # Show only the lower triangle
+           lab = TRUE,                # Overlay correlation coefficients
+           lab_size = 4,              # Size of coefficient text
+           method = "square",         # Element shape ("square" or "circle")
+           colors = c("#6D9EC1", "white", "#E46726"), # Diverging color palette
+           ggtheme = theme_minimal())
+

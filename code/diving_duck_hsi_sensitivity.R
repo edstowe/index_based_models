@@ -605,6 +605,9 @@ sav_final_loc <- sav_sf %>% filter(BARCODE %in% barcode_df$BARCODE)
 barcode_scores_sf <- left_join(sav_final_loc, barcode_scores) 
 
 # --- Load raster (TIFF or VRT) ---
+raster_files <- list.files('data/PhaseII_Baseflow_60kcfs')
+tif_files
+
 raster_path <- "data/PhaseII_Baseflow_60kcfs/Depth_60k.Mississippi_UMR_Ph2_2m_Export_Terrain.Mississippi_UMR_Ph2_2m_Export_Terrain.tif"
   # or .vrt
 r <- terra::rast(raster_path)

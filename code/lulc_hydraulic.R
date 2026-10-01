@@ -383,7 +383,7 @@ p_depth <- ggplot(lulc_hydro_clean,
 
 p_vel <- ggplot(lulc_hydro_clean,
                 aes(x = lc_class, y = velocity_mean, fill = scenario)) +
-  geom_boxplot(outlier.shape = NA, alpha = 0.8, width = 0.65,
+  geom_boxplot(outliers = F, alpha = 0.8, width = 0.65,
                position = position_dodge(0.75)) +
   scale_fill_manual(values = scenario_colors, name = "Flow scenario") +
   scale_y_log10(labels = scales::label_number(accuracy = 0.001)) +
@@ -410,7 +410,7 @@ p_delta <- lulc_hydro_clean %>%
     names_to  = "scenario",
     values_to = "depth_event"
   ) %>%
-  rename(depth_bf = all_of(scenario_labels["bf"])) %>%
+  rename(depth_bf = all_of(unname(scenario_labels["bf"]))) %>%
   filter(!is.na(depth_bf), !is.na(depth_event)) %>%
   mutate(
     depth_increase = depth_event - depth_bf,
